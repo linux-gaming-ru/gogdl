@@ -49,6 +49,14 @@ class SecureLinkTests(unittest.TestCase):
                 api.get_new_secure_link("game")
         self.assertEqual(api.working_on_ids, [])
 
+    def test_api_refresh_passes_patch_root(self) -> None:
+        api = ApiHandler(MagicMock(get_credentials=MagicMock(return_value=None)))
+        self.addCleanup(api.session.close)
+        api.auth_manager.is_credential_expired.return_value = False
+        with patch.object(dl_utils, "get_secure_link", return_value=["fresh"]) as get:
+            self.assertEqual(api.get_new_secure_link("game", root="/patches/store"), ["fresh"])
+        get.assert_called_once_with(api, "/", "game", 2, api.logger, root="/patches/store")
+
 
 if __name__ == "__main__":
     unittest.main()

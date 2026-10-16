@@ -17,6 +17,8 @@ from gogdl.dl.progressbar import ProgressBar
 from gogdl.dl.workers import task_executor
 from gogdl.dl.objects import generic, v2, v1, linux
 
+MAX_DOWNLOAD_ATTEMPTS = 3
+
 class ExecutingManager:
     def __init__(self, api_handler, allowed_threads, path, support, diff, secure_links) -> None:
         self.api_handler = api_handler
@@ -498,6 +500,8 @@ class ExecutingManager:
             return True
         
         self.shutdown()
+        if self.fatal_error:
+            raise OSError("Download failed; completed files are retained for resume")
         if not self.fatal_error:
             self.remove_empty_dirs()
         return self.fatal_error
@@ -556,6 +560,14 @@ class ExecutingManager:
 
 
     def shutdown(self):
+        self.running = False
+        with self.task_cond:
+            self.task_cond.notify()
+        with self.shm_cond:
+            self.shm_cond.notify()
+        for thread in self.threads:
+            thread.join()
+
         self.logger.debug("Stopping progressbar")
         self.progress.completed = True
         if self.progress.is_alive():
@@ -605,7 +617,7 @@ class ExecutingManager:
         self.manager.shutdown()
 
         try:
-            if os.path.exists(self.resume_file):
+            if not self.fatal_error and os.path.exists(self.resume_file):
                 os.remove(self.resume_file)
         except:
             self.logger.error("Failed to remove resume file")
@@ -675,9 +687,27 @@ class ExecutingManager:
         self.logger.debug("Download scheduler out..")
 
 
+    def _refresh_download_link(self, task):
+        product_id = task.product_id
+        if product_id == 'redist':
+            links = dl_utils.get_dependency_link(self.api_handler)
+        elif isinstance(self.shared_secure_links[product_id], str):
+            raise OSError("Installer download link expired; restart the download")
+        else:
+            generation = 2 if isinstance(task, task_executor.DownloadTask2) else 1
+            root = None
+            if product_id.endswith('_patch'):
+                product_id = product_id[:-6]
+                root = '/patches/store'
+            links = self.api_handler.get_new_secure_link(product_id, generation=generation, root=root)
+        if not links:
+            raise OSError("No CDN links available for download")
+        self.shared_secure_links[task.product_id] = links
+
     def process_task_results(self, task_cond: Condition):
         self.logger.debug("Download results collector starting")
         ready_chunks = dict()
+        failed_chunks = Counter()
 
         try:
             task = self.tasks.popleft()
@@ -755,10 +785,22 @@ class ExecutingManager:
                         self.active_tasks -= 1
                     else:
                         self.logger.warning(f"Chunk download failed, reason {res.fail_reason}")
+                        key = (res.task.product_id, res.task.compressed_sum)
+                        failed_chunks[key] += 1
+                        if failed_chunks[key] >= MAX_DOWNLOAD_ATTEMPTS:
+                            self.logger.error("Download retry limit reached for chunk %s", res.task.compressed_sum)
+                            self.fatal_error = True
+                            self.running = False
+                            break
                         try:
+                            if res.fail_reason == task_executor.FailReason.UNAUTHORIZED:
+                                self._refresh_download_link(res.task)
                             self.download_queue.put(res.task, timeout=1)
                         except Exception as e:
-                            self.logger.warning("Failed to resubmit download task, pushing to chunks queue")
+                            self.logger.error("Unable to retry chunk %s (%s)", res.task.compressed_sum, type(e).__name__)
+                            self.fatal_error = True
+                            self.running = False
+                            break
 
                     with task_cond:
                         task_cond.notify()
