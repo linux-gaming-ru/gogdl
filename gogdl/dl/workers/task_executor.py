@@ -164,7 +164,7 @@ class Download(Process):
                     self.speed_queue.put((len(chunk), len(decompressed)))
             except (requests.exceptions.HTTPError, requests.exceptions.ConnectTimeout)  as e:
                 print("Connection failed", e)
-                if response and response.status_code in [401, 403]:
+                if response is not None and response.status_code in [401, 403]:
                     self.results_queue.put(DownloadTaskResult(False, FailReason.UNAUTHORIZED, task))
                     print("Connection failed, unauthorized")
                     return
@@ -225,7 +225,7 @@ class Download(Process):
             except Exception as e:
                 print("Connection failed", e)
                 #Handle exception
-                if response and response.status_code == 401:
+                if response is not None and response.status_code in [401, 403]:
                     self.results_queue.put(DownloadTaskResult(False, FailReason.UNAUTHORIZED, task))
                     return
                 retries -= 1
@@ -480,4 +480,3 @@ class Writer(Process):
         
         self.shared_memory.close()
         shutil.rmtree(self.cache, ignore_errors=True)
-
