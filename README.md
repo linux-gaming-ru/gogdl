@@ -76,6 +76,7 @@ python -m zipapp --output dist/gogdl --python "/usr/bin/env python3" --compress 
 
 ## Great resources about GOG API
 
+- https://github.com/utkarshdalal/GameNative
 - https://github.com/Lariaa/GameLauncherResearch/wiki/
 - https://github.com/Sude-/lgogdownloader
 - https://gogapidocs.readthedocs.io/en/latest/
