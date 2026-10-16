@@ -116,6 +116,7 @@ class Download(Process):
             index = len(urls) - 1
         endpoint = copy(urls[index])
         if task.product_id != 'redist':
+            endpoint["parameters"] = copy(endpoint["parameters"])
             endpoint["parameters"]["path"] += f"/{dl_utils.galaxy_path(task.compressed_sum)}"
             url = dl_utils.merge_url_with_params(
                 endpoint["url_format"], endpoint["parameters"]
@@ -130,6 +131,7 @@ class Download(Process):
             url = urls
         else:
             endpoint = copy(urls[0])
+            endpoint["parameters"] = copy(endpoint["parameters"])
             endpoint["parameters"]["path"] += "/main.bin"
             url = dl_utils.merge_url_with_params(
                 endpoint["url_format"], endpoint["parameters"]
