@@ -15,9 +15,14 @@ from copy import copy
 from gogdl.dl import dl_utils
 from dataclasses import dataclass
 from enum import Enum, auto
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Lock
+from urllib.parse import urlsplit
 from gogdl.dl.objects.generic import MemorySegment, TaskFlag, TerminateWorker
 import gogdl_xdelta3
+
+CDN_SPEED_SMOOTHING = 0.5
+CDN_RECHECK_INTERVAL = 30.0
+CDN_FAILURE_COOLDOWN = 5.0
 
 
 class FailReason(Enum):
@@ -82,14 +87,67 @@ class WriterTaskResult:
     written: int = 0
 
 
+class CDNSelector:
+    def __init__(self, state: dict, lock) -> None:
+        self.state = state
+        self.lock = lock
+
+    def select(self, urls: list, excluded: set) -> int:
+        now = time.monotonic()
+        with self.lock:
+            candidates = []
+            for index, url in enumerate(urls):
+                if index in excluded:
+                    continue
+                host = urlsplit(url).netloc
+                stats = self.state.get(host, {
+                    "speed": None, "active": 0, "checked": 0.0, "retry_after": 0.0,
+                })
+                candidates.append((index, host, stats))
+            available = [item for item in candidates if item[2]["retry_after"] <= now] or candidates
+            probes = [item for item in available if item[2]["active"] == 0 and (
+                item[2]["speed"] is None or now - item[2]["checked"] >= CDN_RECHECK_INTERVAL
+            )]
+            measured = [item for item in available if item[2]["speed"] is not None]
+            if probes:
+                selected = min(probes, key=lambda item: item[2]["checked"])
+            elif measured:
+                selected = max(measured, key=lambda item: item[2]["speed"])
+            else:
+                selected = min(available, key=lambda item: item[2]["active"])
+            index, host, stats = selected
+            stats["active"] += 1
+            self.state[host] = stats
+            return index
+
+    def complete(self, url: str, started: float, size: Optional[int]) -> None:
+        # None marks a failed mirror; zero leaves authorization errors unscored.
+        now = time.monotonic()
+        host = urlsplit(url).netloc
+        with self.lock:
+            stats = self.state[host]
+            stats["active"] -= 1
+            if size is None:
+                stats["retry_after"] = now + CDN_FAILURE_COOLDOWN
+                stats["checked"] = now
+            elif size > 0 and now > started:
+                speed = size / (now - started)
+                previous = stats["speed"] if stats["speed"] is not None else speed
+                stats["speed"] = previous + CDN_SPEED_SMOOTHING * (speed - previous)
+                stats["checked"] = now
+                stats["retry_after"] = 0.0
+            self.state[host] = stats
+
+
 class Download(Process):
-    def __init__(self, shared_memory, download_queue, results_queue, speed_queue, shared_secure_links):
+    def __init__(self, shared_memory, download_queue, results_queue, speed_queue, shared_secure_links, cdn_selector=None):
         self.shared_memory = SharedMemory(name=shared_memory)
         self.download_queue: Queue = download_queue
         self.results_queue: Queue = results_queue
         self.speed_queue: Queue = speed_queue
         self.secure_links: dict = shared_secure_links
         self.session = requests.session()
+        self.cdn_selector = cdn_selector if cdn_selector is not None else CDNSelector({}, Lock())
         self.early_exit = False
         super().__init__()
 
@@ -126,33 +184,37 @@ class Download(Process):
             url = endpoint["url"]
         return url
 
-    def _get_download_url_v1(self, urls):
+    def _get_download_url_v1(self, urls, index=0):
         if type(urls) == str:
             url = urls
         else:
-            endpoint = copy(urls[0])
+            endpoint = copy(urls[index])
             endpoint["parameters"] = copy(endpoint["parameters"])
             endpoint["parameters"]["path"] += "/main.bin"
             url = dl_utils.merge_url_with_params(
                 endpoint["url_format"], endpoint["parameters"]
             )
         return url
-    
+
     def v2(self, task: DownloadTask2):
         retries = 5 
         urls = self.secure_links[task.product_id]
 
         compressed_md5 = task.compressed_sum
-        preferred_endpoint = 0
-        url = self._get_download_url_v2(task, urls, preferred_endpoint)
+        candidates = [self._get_download_url_v2(task, urls, index) for index in range(len(urls))]
+        tried = set()
 
         fail_reason = None
         while retries > 0:
+            endpoint = self.cdn_selector.select(candidates, tried)
+            url = candidates[endpoint]
+            result_size = None
             response = None
             buffer = bytearray()
             compressed_sum = hashlib.md5()
             download_size = 0
             decompressor = zlib.decompressobj()
+            started = time.monotonic()
             try:
                 response = self.session.get(url, stream=True, timeout=(5, 15))
                 response.raise_for_status()
@@ -162,9 +224,15 @@ class Download(Process):
                     decompressed = decompressor.decompress(chunk)
                     buffer += decompressed
                     self.speed_queue.put((len(chunk), len(decompressed)))
+                if compressed_sum.hexdigest() != compressed_md5:
+                    raise ValueError("Compressed chunk checksum mismatch")
+                result_size = download_size
+            except ValueError:
+                fail_reason = FailReason.CHECKSUM
             except (requests.exceptions.HTTPError, requests.exceptions.ConnectTimeout)  as e:
                 print("Connection failed", e)
                 if response is not None and response.status_code in [401, 403]:
+                    result_size = 0
                     self.results_queue.put(DownloadTaskResult(False, FailReason.UNAUTHORIZED, task))
                     print("Connection failed, unauthorized")
                     return
@@ -178,11 +246,14 @@ class Download(Process):
                 fail_reason = FailReason.UNKNOWN
             else:
                 break
-            preferred_endpoint += 1
-            if preferred_endpoint >= len(urls):
-                preferred_endpoint = 0
+            finally:
+                self.cdn_selector.complete(url, started, result_size)
+                if response is not None:
+                    response.close()
+            tried.add(endpoint)
+            if len(tried) == len(candidates):
+                tried.clear()
                 time.sleep(2)
-            url = self._get_download_url_v2(task, urls, preferred_endpoint)
             retries -= 1
         else:
             self.results_queue.put(DownloadTaskResult(False, fail_reason, task))
@@ -198,10 +269,6 @@ class Download(Process):
             self.results_queue.put(DownloadTaskResult(False, FailReason.UNKNOWN, task))
             return 
 
-        if compressed_sum.hexdigest() != compressed_md5:
-            self.results_queue.put(DownloadTaskResult(False, FailReason.CHECKSUM, task))
-            return 
-
         self.results_queue.put(DownloadTaskResult(True, None, task, download_size=download_size, decompressed_size=decompressed_size))
     
     def v1(self, task: DownloadTask1):
@@ -209,28 +276,46 @@ class Download(Process):
         urls = self.secure_links[task.product_id]
 
         response = None
-        url = self._get_download_url_v1(urls)
+        candidates = [urls] if isinstance(urls, str) else [
+            self._get_download_url_v1(urls, index) for index in range(len(urls))
+        ]
+        tried = set()
         range_header = dl_utils.get_range_header(task.offset, task.size)
 
         buffer = bytearray()
         while retries > 0:
+            endpoint = self.cdn_selector.select(candidates, tried)
+            url = candidates[endpoint]
+            result_size = None
             response = None
             buffer = bytearray()
+            started = time.monotonic()
             try:
                 response = self.session.get(url, stream=True, timeout=10, headers={'Range': range_header})
                 response.raise_for_status()
                 for chunk in response.iter_content(1024 * 512):
                     buffer += chunk 
                     self.speed_queue.put((len(chunk), len(chunk)))
+                if len(buffer) != task.size:
+                    raise ValueError("Downloaded chunk size mismatch")
+                result_size = len(buffer)
             except Exception as e:
                 print("Connection failed", e)
                 #Handle exception
                 if response is not None and response.status_code in [401, 403]:
+                    result_size = 0
                     self.results_queue.put(DownloadTaskResult(False, FailReason.UNAUTHORIZED, task))
                     return
+                tried.add(endpoint)
+                if len(tried) == len(candidates):
+                    tried.clear()
                 retries -= 1
                 time.sleep(2)
                 continue
+            finally:
+                self.cdn_selector.complete(url, started, result_size)
+                if response is not None:
+                    response.close()
             break
         else:
             self.results_queue.put(DownloadTaskResult(False, FailReason.CHECKSUM, task))
@@ -246,11 +331,7 @@ class Download(Process):
             self.results_queue.put(DownloadTaskResult(False, FailReason.UNKNOWN, task))
             return 
 
-        if len(buffer) != task.size:
-            self.results_queue.put(DownloadTaskResult(False, FailReason.CHECKSUM, task))
-            return 
-
-        self.results_queue.put(DownloadTaskResult(True, None, task, download_size=download_size, decompressed_size=download_size))
+        self.results_queue.put(DownloadTaskResult(True, None, task, download_size=download_size))
 
 class Writer(Process):
     def __init__(self, shared_memory, writer_queue, results_queue, speed_queue, cache):

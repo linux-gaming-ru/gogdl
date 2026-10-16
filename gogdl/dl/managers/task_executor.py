@@ -72,6 +72,7 @@ class ExecutingManager:
         self.manager = ProcessingManager()
         self.shared_secure_links = self.manager.dict()
         self.shared_secure_links.update(self.secure_links)
+        self.cdn_selector = task_executor.CDNSelector(self.manager.dict(), self.manager.Lock())
 
         # Required space for download to succeed
         required_disk_size_delta = 0
@@ -477,7 +478,7 @@ class ExecutingManager:
 
             # Spawn workers 
             for _ in range(self.allowed_threads):
-                worker = task_executor.Download(self.shared_memory.name, self.download_queue, self.download_res_queue, self.download_speed_updates, self.shared_secure_links)
+                worker = task_executor.Download(self.shared_memory.name, self.download_queue, self.download_res_queue, self.download_speed_updates, self.shared_secure_links, self.cdn_selector)
                 worker.start()
                 self.download_workers.append(worker)
         

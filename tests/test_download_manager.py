@@ -21,6 +21,7 @@ class DownloadManagerTests(unittest.TestCase):
             MagicMock(), 1, temporary.name, None, generic.BaseDiff(), {},
         )
         self.manager.fatal_error = False
+        self.manager.cdn_selector = MagicMock()
         self.manager.shared_secure_links = {"game": ["expired"]}
         self.manager.download_queue = MagicMock()
         self.manager.download_res_queue = MagicMock()
