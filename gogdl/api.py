@@ -83,10 +83,12 @@ class ApiHandler:
     def get_new_secure_link(self, id, path="/", generation=2):
         if id not in self.working_on_ids:
             self.working_on_ids.append(id)
-            new = self.__obtain_secure_link(id, path, generation)
-            self.endpoints[id] = new
-            self.working_on_ids.remove(id)
-            return new
+            try:
+                new = self.__obtain_secure_link(id, path, generation)
+                self.endpoints[id] = new
+                return new
+            finally:
+                self.working_on_ids.remove(id)
         else:
             while True:
                 if self.endpoints.get(id):

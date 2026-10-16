@@ -10,6 +10,8 @@ from sys import exit, platform
 
 PATH_SEPARATOR = os.sep
 TIMEOUT = 10
+SECURE_LINK_ATTEMPTS = 5
+SECURE_LINK_RETRY_DELAY = 0.2
 
 
 def get_json(api_handler, url):
@@ -60,23 +62,22 @@ def get_secure_link(api_handler, path, gameId, generation=2, logger=None, root=N
     if root:
         url += f"&root={root}"
 
-    try:
-        r = requests.get(url, headers=api_handler.session.headers, timeout=TIMEOUT)
-    except BaseException as exception:
-        if logger:
-            logger.info(exception)
-        time.sleep(0.2)
-        return get_secure_link(api_handler, path, gameId, generation, logger)
-
-    if r.status_code != 200:
-        if logger:
-            logger.info("invalid secure link response")
-        time.sleep(0.2)
-        return get_secure_link(api_handler, path, gameId, generation, logger)
-
-    js = r.json()
-
-    return js['urls']
+    for attempt in range(SECURE_LINK_ATTEMPTS):
+        r = None
+        try:
+            r = requests.get(url, headers=api_handler.session.headers, timeout=TIMEOUT)
+            if r.status_code != 200:
+                raise requests.HTTPError(f"Secure link request returned HTTP {r.status_code}")
+            return r.json()['urls']
+        except requests.RequestException as exception:
+            if logger:
+                logger.warning("Secure link request failed (%s)", type(exception).__name__)
+            if attempt == SECURE_LINK_ATTEMPTS - 1:
+                raise
+        finally:
+            if r is not None:
+                r.close()
+        time.sleep(SECURE_LINK_RETRY_DELAY)
 
 def get_dependency_link(api_handler):
     data = get_json(
@@ -176,4 +177,3 @@ def get_case_insensitive_name(path):
     if paths_to_find != paths_found:
         root = os.path.join(root, os.sep.join(s_working_dir[paths_found:]))
     return root
-
